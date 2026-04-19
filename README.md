@@ -33,7 +33,7 @@ cs-f425-agent/
 
 ```python
 !git clone https://github.com/YOUR_USERNAME/cs-f425-agent.git
-%cd cs-f425-agent
+%cd dl-project
 ```
 
 ### 2. Install dependencies
