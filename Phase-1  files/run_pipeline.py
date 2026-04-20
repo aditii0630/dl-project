@@ -27,7 +27,6 @@ def parse_agent_action(action_str):
         if match:
             return {"tool": "aggregate", "args": {"column": match.group(1), "agg": "sum"}}
 
-    # FIX: aggregate_mean was missing from the original
     elif action_str.startswith("aggregate_mean"):
         match = re.search(r"column='([^']+)'", action_str)
         if match:

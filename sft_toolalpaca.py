@@ -13,6 +13,7 @@
 # ============================================================
 
 import json
+import os
 import torch
 from datasets import Dataset
 from transformers import (
@@ -22,13 +23,12 @@ from transformers import (
     TrainingArguments,
 )
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
-from trl import SFTTrainer
 
 
 # ----------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------
-MODEL_ID    = "mistralai/Mistral-7B-v0.1"
+MODEL_ID    = os.getenv("MODEL_ID", "mistralai/Mistral-7B-v0.1")
 OUTPUT_DIR  = "./sft_adapter"
 HF_REPO     = None        # set to "username/repo" to push weights
 MAX_SEQ_LEN = 512
@@ -130,17 +130,49 @@ def load_trajectories(path: str) -> Dataset:
 # QLoRA model setup
 # ----------------------------------------------------------------
 
-def load_base_model():
-    bnb = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=torch.float16,
-    )
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID, quantization_config=bnb, device_map="auto", trust_remote_code=True
-    )
-    model = prepare_model_for_kbit_training(model)
+def _is_bitsandbytes_4bit_healthy() -> bool:
+    try:
+        import bitsandbytes as bnb
+        # Trigger a tiny 4-bit op to verify native CUDA path is actually usable.
+        probe = torch.randn(128, device="cuda", dtype=torch.float16)
+        bnb.functional.quantize_4bit(probe, quant_type="nf4")
+        return True
+    except Exception:
+        return False
+
+
+def load_base_model(model_id: str | None = None, use_4bit_preference: bool = True):
+    model_id = model_id or MODEL_ID
+    use_4bit = bool(use_4bit_preference and torch.cuda.is_available() and _is_bitsandbytes_4bit_healthy())
+
+    if use_4bit:
+        bnb = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.float16,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, quantization_config=bnb, device_map="auto", trust_remote_code=True
+        )
+        model = prepare_model_for_kbit_training(model)
+    else:
+        if torch.cuda.is_available():
+            total_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+            if total_gb < 28:
+                raise RuntimeError(
+                    "7B training requires either healthy 4-bit bitsandbytes or a larger GPU. "
+                    f"Detected ~{total_gb:.1f} GB VRAM without usable 4-bit path. "
+                    "Use A100/H100 runtime or fix bitsandbytes CUDA dependencies."
+                )
+
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float16,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+
     model = get_peft_model(model, LoraConfig(
         r=LORA_R, lora_alpha=LORA_ALPHA,
         target_modules=LORA_TARGET,
@@ -156,12 +188,15 @@ def load_base_model():
 # ----------------------------------------------------------------
 
 def train(trajectories_path: str = "agent_trajectories_2k.json"):
+    from trl import SFTTrainer
+
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
     tokenizer.pad_token    = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
     ds    = load_trajectories(trajectories_path)
-    model = load_base_model()
+    use_4bit = bool(torch.cuda.is_available() and _is_bitsandbytes_4bit_healthy())
+    model = load_base_model(use_4bit_preference=use_4bit)
 
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
@@ -175,7 +210,7 @@ def train(trajectories_path: str = "agent_trajectories_2k.json"):
         logging_steps=20,
         save_steps=200,
         save_total_limit=2,
-        optim="paged_adamw_8bit",
+        optim="paged_adamw_8bit" if use_4bit else "adamw_torch",
         report_to="none",
         dataloader_pin_memory=False,
         gradient_checkpointing=True,
