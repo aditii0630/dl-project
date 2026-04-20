@@ -3,4 +3,6 @@ pipeline_results.txt
 project_description_v2.0.txt
 requirements.txt
 sft_adapter_export.zip
-/sft_adapter_export
+sft_adapter_export/
+__pycache__/
+.ipynb_checkpoints/
